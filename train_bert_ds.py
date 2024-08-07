@@ -265,6 +265,7 @@ def create_data_iterator(
             be able to continuously generate samples
 
     """
+    start_time = time.time()
     wikitext_dataset = datasets.load_dataset("wikitext",
                                              "wikitext-2-v1",
                                              split="train")
@@ -281,6 +282,9 @@ def create_data_iterator(
         max_length=max_seq_length,
     )
     dataset = WikiTextMLMDataset(wikitext_dataset, masking_function_partial)
+    end_time = time.time()
+    log_dist(f"<= Timer => Data preloading took {end_time - start_time:.2f} seconds", ranks=[0], level=logging.INFO)
+
     collate_fn_partial = partial(collate_function,
                                  pad_token_id=tokenizer.pad_token_id)
     dataloader = DataLoader(dataset,
@@ -782,6 +786,8 @@ def train(
     ################################
     log_dist("Creating DeepSpeed engine", ranks=[0], level=logging.INFO)
     assert (dtype == 'fp16' or dtype == 'bf16')
+    # Start timing the DeepSpeed engine creation
+    start_time = time.time()
     ds_config = {
         "train_micro_batch_size_per_gpu": batch_size,
         "optimizer": {
@@ -804,14 +810,23 @@ def train(
                                         model_parameters=model.parameters(),
                                         config=ds_config)
     log_dist("DeepSpeed engine created", ranks=[0], level=logging.INFO)
+
+    # End timing the DeepSpeed engine creation
+    end_time = time.time()
+    log_dist(f"<= Timer => DeepSpeed engine creation took {end_time - start_time:.2f} seconds", ranks=[0], level=logging.INFO)
+
     ################################
     #### Load Model checkpoint #####
     ################################
     start_step = 1
     if load_checkpoint_dir is not None:
+        start_time = time.time()
         _, client_state = model.load_checkpoint(load_dir=load_checkpoint_dir)
         checkpoint_step = client_state['checkpoint_step']
         start_step = checkpoint_step + 1
+
+        end_time = time.time()
+        log_dist(f"<= Timer => Checkpoint loading took {end_time - start_time:.2f} seconds", ranks=[0], level=logging.INFO)
 
     ################################
     ####### The Training Loop ######
@@ -827,6 +842,9 @@ def train(
         log_dist(f"Step: {step}", ranks=[0], level=logging.INFO)  # Log the step
         if step >= num_iterations:
             break
+
+        epoch_start_time = time.time()
+
         # Move the tensors to device
         for key, value in batch.items():
             batch[key] = value.to("cpu")  # Ensure all tensors are moved to CPU
@@ -844,15 +862,27 @@ def train(
             if is_rank_0():
                 summary_writer.add_scalar(f"Train/loss", np.mean(losses), step)
         if step % checkpoint_every == 0:
+            start_time = time.time()
             model.save_checkpoint(save_dir=exp_dir,
                                 client_state={'checkpoint_step': step})
+            end_time = time.time()
+            log_dist(f"<= Timer => Checkpoint saving took {end_time - start_time:.2f} seconds", ranks=[0], level=logging.INFO)
+
             log_dist("Saved model to {0}".format(exp_dir),
                     ranks=[0],
                     level=logging.INFO)
+
+        epoch_end_time = time.time()
+        log_dist(f"<= Timer => Epoch {step} took {epoch_end_time - epoch_start_time:.2f} seconds", ranks=[0], level=logging.INFO)
+
     # Save the last checkpoint if not saved yet
     if step % checkpoint_every != 0:
+        start_time = time.time()
         model.save_checkpoint(save_dir=exp_dir,
                             client_state={'checkpoint_step': step})
+        end_time = time.time()
+        log_dist(f"<= Timer => Checkpoint saving took {end_time - start_time:.2f} seconds", ranks=[0], level=logging.INFO)
+
         log_dist("Saved model to {0}".format(exp_dir),
                 ranks=[0],
                 level=logging.INFO)
