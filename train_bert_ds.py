@@ -608,9 +608,9 @@ def train(
         tokenizer: str = "roberta-base",
         # Model Parameters
         num_layers: int = 2,  # Reduced from 6 to 2
-        num_heads: int = 2,   # Reduced from 8 to 2
-        ff_dim: int = 256,    # Reduced from 512 to 256
-        h_dim: int = 128,     # Reduced from 256 to 128
+        num_heads: int = 4,   # Reduced from 8 to 4
+        ff_dim: int = 512,
+        h_dim: int = 256,     # Reduced from 256 to 128
         dropout: float = 0.1,
         # Training Parameters
         batch_size: int = 8,
