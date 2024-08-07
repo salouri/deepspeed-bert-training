@@ -265,7 +265,7 @@ def create_data_iterator(
             be able to continuously generate samples
 
     """
-    start_time = time.time()
+    data_loading_start = time.time()
     wikitext_dataset = datasets.load_dataset("wikitext",
                                              "wikitext-2-v1",
                                              split="train")
@@ -282,8 +282,8 @@ def create_data_iterator(
         max_length=max_seq_length,
     )
     dataset = WikiTextMLMDataset(wikitext_dataset, masking_function_partial)
-    end_time = time.time()
-    log_dist(f"<= Timer => Data preloading took {end_time - start_time:.2f} seconds", ranks=[0], level=logging.INFO)
+    data_loading_end = time.time()
+    log_dist(f"<= Timer => Data preloading took {data_loading_end - data_loading_start:.2f} seconds", ranks=[0], level=logging.INFO)
 
     collate_fn_partial = partial(collate_function,
                                  pad_token_id=tokenizer.pad_token_id)
@@ -839,6 +839,7 @@ def train(
         level=logging.INFO)
     model.train()
     losses = []
+    epoch_times = []
     log_dist("Starting training loop", ranks=[0], level=logging.INFO)
     for step, batch in enumerate(data_iterator, start=start_step):
         log_dist(f"Step: {step}", ranks=[0], level=logging.INFO)  # Log the step
@@ -875,7 +876,13 @@ def train(
                     level=logging.INFO)
 
         epoch_end_time = time.time()
-        log_dist(f"<= Timer => Epoch {step} took {epoch_end_time - epoch_start_time:.2f} seconds", ranks=[0], level=logging.INFO)
+        epoch_time = epoch_end_time - epoch_start_time
+        epoch_times.append(epoch_time)
+        log_dist(f"<= Timer => Epoch {step} took {epoch_time:.2f} seconds", ranks=[0], level=logging.INFO)
+
+    if epoch_times:
+        avg_epoch_time = sum(epoch_times) / len(epoch_times)
+        log_dist(f"<= Timer => Average epoch time: {avg_epoch_time:.2f} seconds", ranks=[0], level=logging.INFO)
 
     # Save the last checkpoint if not saved yet
     if step % checkpoint_every != 0:
@@ -891,7 +898,7 @@ def train(
     time.sleep(0.1)  # Optional: Add a small delay to see log output more frequently
 
     training_end_time = time.time()
-    log_dist(f"<= Timer => Total training time: {training_end_time - training_start_time:.2f} seconds", ranks=[0], level=logging.INFO)
+    log_dist(f"<= Timer => Total training time: {(training_end_time - training_start_time) /60:.2f} minutes", ranks=[0], level=logging.INFO)
 
     return exp_dir
 
