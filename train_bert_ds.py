@@ -674,6 +674,8 @@ def train(
         pathlib.Path: The final experiment directory
 
     """
+    training_start_time = time.time()
+
     # device = (torch.device(get_accelerator().device_name(), local_rank) if (local_rank > -1)
     #           and get_accelerator().is_available() else torch.device("cpu"))
     device = torch.device("cpu")
@@ -887,6 +889,9 @@ def train(
                 ranks=[0],
                 level=logging.INFO)
     time.sleep(0.1)  # Optional: Add a small delay to see log output more frequently
+
+    training_end_time = time.time()
+    log_dist(f"<= Timer => Total training time: {training_end_time - training_start_time:.2f} seconds", ranks=[0], level=logging.INFO)
 
     return exp_dir
 
