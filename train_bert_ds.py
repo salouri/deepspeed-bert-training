@@ -1,590 +1,74 @@
-"""
-Modified version of train_bert.py that adds DeepSpeed
-"""
-
 import os
-import datetime
-import json
-import pathlib
-import re
-import string
-from functools import partial
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, TypeVar, Union
 import time
-
-import random
-import datasets
-import fire
-import logging
-import loguru
-import numpy as np
-import pytz
-import sh
-import torch
-import torch.nn as nn
-import deepspeed
 from torch.utils.data import DataLoader, Dataset
-from torch.utils.tensorboard import SummaryWriter
-from transformers import AutoTokenizer, PreTrainedTokenizer, PreTrainedTokenizerFast
-from transformers.models.roberta import RobertaConfig, RobertaModel
-from transformers.models.roberta.modeling_roberta import (
-    RobertaLMHead,
-    RobertaPreTrainedModel,
-)
-
-from deepspeed.accelerator import get_accelerator
-
-def is_rank_0() -> bool:
-    return int(os.environ.get("RANK", "0")) == 0
-
-
-######################################################################
-####################### Logging Functions ############################
-######################################################################
-
-logger = loguru.logger
-
-
-def log_dist(message: str,
-             ranks: List[int] = [],
-             level: int = logging.INFO) -> None:
-    """Log messages for specified ranks only"""
-    my_rank = int(os.environ.get("RANK", "0"))
-    if my_rank in ranks:
-        if level == logging.INFO:
-            logger.info(f'[Rank {my_rank}] {message}')
-        if level == logging.ERROR:
-            logger.error(f'[Rank {my_rank}] {message}')
-        if level == logging.DEBUG:
-            logger.debug(f'[Rank {my_rank}] {message}')
-
-
-######################################################################
-############### Dataset Creation Related Functions ###################
-######################################################################
-
-TokenizerType = Union[PreTrainedTokenizer, PreTrainedTokenizerFast]
-
-
-def collate_function(batch: List[Tuple[List[int], List[int]]],
-                     pad_token_id: int) -> Dict[str, torch.Tensor]:
-    """Collect a list of masked token indices, and labels, and
-    batch them, padding to max length in the batch.
-    """
-    max_length = max(len(token_ids) for token_ids, _ in batch)
-    padded_token_ids = [
-        token_ids +
-        [pad_token_id for _ in range(0, max_length - len(token_ids))]
-        for token_ids, _ in batch
-    ]
-    padded_labels = [
-        labels + [pad_token_id for _ in range(0, max_length - len(labels))]
-        for _, labels in batch
-    ]
-    src_tokens = torch.LongTensor(padded_token_ids)
-    tgt_tokens = torch.LongTensor(padded_labels)
-    attention_mask = src_tokens.ne(pad_token_id).type_as(src_tokens)
-    return {
-        "src_tokens": src_tokens,
-        "tgt_tokens": tgt_tokens,
-        "attention_mask": attention_mask,
-    }
-
-
-def masking_function(
-        text: str,
-        tokenizer: TokenizerType,
-        mask_prob: float,
-        random_replace_prob: float,
-        unmask_replace_prob: float,
-        max_length: int,
-) -> Tuple[List[int], List[int]]:
-
-    # Note: By default, encode does add the BOS and EOS token
-    # Disabling that behaviour to make this more clear
-    tokenized_ids = ([tokenizer.bos_token_id] +
-                     tokenizer.encode(text,
-                                      add_special_tokens=False,
-                                      truncation=True,
-                                      max_length=max_length - 2) +
-                     [tokenizer.eos_token_id])
-    seq_len = len(tokenized_ids)
-    tokenized_ids = np.array(tokenized_ids)
-    subword_mask = np.full(len(tokenized_ids), False)
-
-    # Masking the BOS and EOS token leads to slightly worse performance
-    low = 1
-    high = len(subword_mask) - 1
-    mask_choices = np.arange(low, high)
-    num_subwords_to_mask = max(
-        int((mask_prob * (high - low)) + np.random.rand()), 1)
-    subword_mask[np.random.choice(mask_choices,
-                                  num_subwords_to_mask,
-                                  replace=False)] = True
-
-    # Create the labels first
-    labels = np.full(seq_len, tokenizer.pad_token_id)
-    labels[subword_mask] = tokenized_ids[subword_mask]
-
-    tokenized_ids[subword_mask] = tokenizer.mask_token_id
-
-    # Now of the masked tokens, choose how many to replace with random and how many to unmask
-    rand_or_unmask_prob = random_replace_prob + unmask_replace_prob
-    if rand_or_unmask_prob > 0:
-        rand_or_unmask = subword_mask & (np.random.rand(len(tokenized_ids)) <
-                                         rand_or_unmask_prob)
-        if random_replace_prob == 0:
-            unmask = rand_or_unmask
-            rand_mask = None
-        elif unmask_replace_prob == 0:
-            unmask = None
-            rand_mask = rand_or_unmask
-        else:
-            unmask_prob = unmask_replace_prob / rand_or_unmask_prob
-            decision = np.random.rand(len(tokenized_ids)) < unmask_prob
-            unmask = rand_or_unmask & decision
-            rand_mask = rand_or_unmask & (~decision)
-        if unmask is not None:
-            tokenized_ids[unmask] = labels[unmask]
-        if rand_mask is not None:
-            weights = np.ones(tokenizer.vocab_size)
-            weights[tokenizer.all_special_ids] = 0
-            probs = weights / weights.sum()
-            num_rand = rand_mask.sum()
-            tokenized_ids[rand_mask] = np.random.choice(tokenizer.vocab_size,
-                                                        num_rand,
-                                                        p=probs)
-    return tokenized_ids.tolist(), labels.tolist()
-
-
-class WikiTextMLMDataset(Dataset):
-    def __init__(
-        self,
-        dataset: datasets.arrow_dataset.Dataset,
-        masking_function: Callable[[str], Tuple[List[int], List[int]]],
-    ) -> None:
-        self.dataset = dataset
-        self.masking_function = masking_function
-
-    def __len__(self) -> int:
-        return len(self.dataset)
-
-    def __getitem__(self, idx: int) -> Tuple[List[int], List[int]]:
-        tokens, labels = self.masking_function(self.dataset[idx]["text"])
-        return (tokens, labels)
-
-
-T = TypeVar("T")
-
-
-class InfiniteIterator(object):
-    def __init__(self, iterable: Iterable[T]) -> None:
-        self._iterable = iterable
-        self._iterator = iter(self._iterable)
-
-    def __iter__(self):
-        return self
-
-    def __next__(self) -> T:
-        next_item = None
-        try:
-            next_item = next(self._iterator)
-        except StopIteration:
-            self._iterator = iter(self._iterable)
-            next_item = next(self._iterator)
-        return next_item
-
-
-def create_data_iterator(
-        mask_prob: float,
-        random_replace_prob: float,
-        unmask_replace_prob: float,
-        batch_size: int,
-        max_seq_length: int = 512,
-        tokenizer: str = "roberta-base",
-) -> InfiniteIterator:
-
-    data_loading_start = time.time()
-    wikitext_dataset = datasets.load_dataset("wikitext",
-                                             "wikitext-2-v1",
-                                             split="train")
-    wikitext_dataset = wikitext_dataset.filter(
-        lambda record: record["text"] != "").map(
-            lambda record: {"text": record["text"].rstrip("\n")})
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer)
-    masking_function_partial = partial(
-        masking_function,
-        tokenizer=tokenizer,
-        mask_prob=mask_prob,
-        random_replace_prob=random_replace_prob,
-        unmask_replace_prob=unmask_replace_prob,
-        max_length=max_seq_length,
-    )
-    dataset = WikiTextMLMDataset(wikitext_dataset, masking_function_partial)
-    data_loading_end = time.time()
-    log_dist(f"<= Timer => Data preloading took {data_loading_end - data_loading_start:.2f} seconds", ranks=[0], level=logging.INFO)
-
-    collate_fn_partial = partial(collate_function,
-                                 pad_token_id=tokenizer.pad_token_id)
-    dataloader = DataLoader(dataset,
-                            batch_size=batch_size,
-                            shuffle=True,
-                            collate_fn=collate_fn_partial)
-
-    return InfiniteIterator(dataloader)
-
-
-######################################################################
-############### Model Creation Related Functions #####################
-######################################################################
-
-
-class RobertaLMHeadWithMaskedPredict(RobertaLMHead):
-    def __init__(self,
-                 config: RobertaConfig,
-                 embedding_weight: Optional[torch.Tensor] = None) -> None:
-        super(RobertaLMHeadWithMaskedPredict, self).__init__(config)
-        if embedding_weight is not None:
-            self.decoder.weight = embedding_weight
-
-    def forward(  # pylint: disable=arguments-differ
-        self,
-        features: torch.Tensor,
-        masked_token_indices: Optional[torch.Tensor] = None,
-        **kwargs,
-    ) -> torch.Tensor:
-
-        if masked_token_indices is not None:
-            features = torch.index_select(
-                features.view(-1, features.shape[-1]), 0, masked_token_indices)
-        return super().forward(features)
-
-
-class RobertaMLMModel(RobertaPreTrainedModel):
-    def __init__(self, config: RobertaConfig, encoder: RobertaModel) -> None:
-        super().__init__(config)
-        self.encoder = encoder
-        self.lm_head = RobertaLMHeadWithMaskedPredict(
-            config, self.encoder.embeddings.word_embeddings.weight)
-        self.lm_head.apply(self._init_weights)
-
-    def forward(
-            self,
-            src_tokens: torch.Tensor,
-            attention_mask: torch.Tensor,
-            tgt_tokens: torch.Tensor,
-    ) -> torch.Tensor:
-
-        # shape: (batch, seq_len, h_dim)
-        sequence_output, *_ = self.encoder(input_ids=src_tokens,
-                                           attention_mask=attention_mask,
-                                           return_dict=False)
-
-        pad_token_id = self.config.pad_token_id
-        # (labels have also been padded with pad_token_id)
-        # filter out all masked labels
-        # shape: (num_masked_tokens,)
-        masked_token_indexes = torch.nonzero(
-            (tgt_tokens != pad_token_id).view(-1)).view(-1)
-        # shape: (num_masked_tokens, vocab_size)
-        prediction_scores = self.lm_head(sequence_output, masked_token_indexes)
-        # shape: (num_masked_tokens,)
-        target = torch.index_select(tgt_tokens.view(-1), 0,
-                                    masked_token_indexes)
-
-        loss_fct = nn.CrossEntropyLoss(ignore_index=-1)
-
-        masked_lm_loss = loss_fct(
-            prediction_scores.view(-1, self.config.vocab_size), target)
-        return masked_lm_loss
-
-
-def create_model(num_layers: int, num_heads: int, ff_dim: int, h_dim: int,
-                 dropout: float) -> RobertaMLMModel:
-
-    roberta_config_dict = {
-        "attention_probs_dropout_prob": dropout,
-        "bos_token_id": 0,
-        "eos_token_id": 2,
-        "hidden_act": "gelu",
-        "hidden_dropout_prob": dropout,
-        "hidden_size": h_dim,
-        "initializer_range": 0.02,
-        "intermediate_size": ff_dim,
-        "layer_norm_eps": 1e-05,
-        "max_position_embeddings": 514,
-        "model_type": "roberta",
-        "num_attention_heads": num_heads,
-        "num_hidden_layers": num_layers,
-        "pad_token_id": 1,
-        "type_vocab_size": 1,
-        "vocab_size": 50265,
-    }
-    roberta_config = RobertaConfig.from_dict(roberta_config_dict)
-    roberta_encoder = RobertaModel(roberta_config)
-    roberta_model = RobertaMLMModel(roberta_config, roberta_encoder)
-    return roberta_model
-
-
-######################################################################
-########### Experiment Management Related Functions ##################
-######################################################################
-
-
-def get_unique_identifier(length: int = 8) -> str:
-    """Create a unique identifier by choosing `length`
-    random characters from list of ascii characters and numbers
-    """
-    alphabet = string.ascii_lowercase + string.digits
-    uuid = "".join(alphabet[ix]
-                   for ix in np.random.choice(len(alphabet), length))
-    return uuid
-
-
-def create_experiment_dir(checkpoint_dir: pathlib.Path,
-                          all_arguments: Dict[str, Any]) -> pathlib.Path:
-
-    # experiment name follows the following convention
-    # {exp_type}.{YYYY}.{MM}.{DD}.{HH}.{MM}.{SS}.{uuid}
-    current_time = datetime.datetime.now(pytz.timezone("US/Pacific"))
-    expname = "bert_pretrain.{0}.{1}.{2}.{3}.{4}.{5}.{6}".format(
-        current_time.year,
-        current_time.month,
-        current_time.day,
-        current_time.hour,
-        current_time.minute,
-        current_time.second,
-        get_unique_identifier(),
-    )
-    exp_dir = checkpoint_dir / expname
-    if not is_rank_0():
-        return exp_dir
-    exp_dir.mkdir(exist_ok=False)
-    hparams_file = exp_dir / "hparams.json"
-    with hparams_file.open("w") as handle:
-        json.dump(obj=all_arguments, fp=handle, indent=2)
-    # Save the git hash
-    try:
-        gitlog = sh.git.log("-1", format="%H", _tty_out=False, _fg=False)
-        with (exp_dir / "githash.log").open("w") as handle:
-            handle.write(gitlog)
-    except sh.ErrorReturnCode_128:
-        log_dist(
-            "Seems like the code is not running from"
-            " within a git repo, so hash will"
-            " not be stored. However, it"
-            " is strongly advised to use"
-            " version control.",
-            ranks=[0],
-            level=logging.INFO)
-    # And the git diff
-    try:
-        gitdiff = sh.git.diff(_fg=False, _tty_out=False)
-        with (exp_dir / "gitdiff.log").open("w") as handle:
-            handle.write(gitdiff)
-    except sh.ErrorReturnCode_129:
-        log_dist(
-            "Seems like the code is not running from"
-            " within a git repo, so diff will"
-            " not be stored. However, it"
-            " is strongly advised to use"
-            " version control.",
-            ranks=[0],
-            level=logging.INFO)
-    # Finally create the Tensorboard Dir
-    tb_dir = exp_dir / "tb_dir"
-    tb_dir.mkdir(exist_ok=False)
-    return exp_dir
-
-
-######################################################################
-################ Checkpoint Related Functions ########################
-######################################################################
-
-
-def load_model_checkpoint(
-    load_checkpoint_dir: pathlib.Path,
-    model: torch.nn.Module,
-    optimizer: torch.optim.Optimizer,
-) -> Tuple[int, torch.nn.Module, torch.optim.Optimizer]:
-
-    log_dist(
-        f"Loading model and optimizer checkpoint from {load_checkpoint_dir}",
-        ranks=[0],
-        level=logging.INFO)
-    checkpoint_files = list(
-        filter(
-            lambda path: re.search(r"iter_(?P<iter_no>\d+)\.pt", path.name) is
-            not None,
-            load_checkpoint_dir.glob("*.pt"),
-        ))
-    assert len(checkpoint_files) > 0, "No checkpoints found in directory"
-    checkpoint_files = sorted(
-        checkpoint_files,
-        key=lambda path: int(
-            re.search(r"iter_(?P<iter_no>\d+)\.pt", path.name).group("iter_no")
-        ),
-    )
-    latest_checkpoint_path = checkpoint_files[-1]
-    checkpoint_step = int(
-        re.search(r"iter_(?P<iter_no>\d+)\.pt",
-                  latest_checkpoint_path.name).group("iter_no"))
-
-    state_dict = torch.load(latest_checkpoint_path)
-    model.load_state_dict(state_dict["model"], strict=True)
-    optimizer.load_state_dict(state_dict["optimizer"])
-    log_dist(
-        f"Loading model and optimizer checkpoints done. Loaded from {latest_checkpoint_path}",
-        ranks=[0],
-        level=logging.INFO)
-    return checkpoint_step, model, optimizer
-
-
-######################################################################
-######################## Driver Functions ############################
-######################################################################
-
+import deepspeed
+from transformers import AutoTokenizer
+from datasets import load_dataset
+import json
+from functools import partial
+from typing import Dict, Any
+import random
+import numpy as np
+import datetime
+import pytz
+import pathlib
+import fire
+
+from utils.data_utils import masking_function, WikiTextMLMDataset, create_experiment_dir
+from utils.training_utils import log_dist, is_rank_0, create_model
+from utils.namedPipeManager import NamedPipeManager
+
+# Named pipe path
+DATA_PIPE_PATH = "/tmp/data_pipe"
 
 def train(
         checkpoint_dir: str = None,
         load_checkpoint_dir: str = None,
-        # Dataset Parameters
         mask_prob: float = 0.15,
         random_replace_prob: float = 0.1,
         unmask_replace_prob: float = 0.1,
         max_seq_length: int = 512,
         tokenizer: str = "roberta-base",
-        # Model Parameters
-        num_layers: int = 2,  # Reduced from 6 to 2
-        num_heads: int = 4,   # Reduced from 8 to 4
-        ff_dim: int = 512,
-        h_dim: int = 256,
+        num_layers: int = 12,
+        num_heads: int = 12,
+        ff_dim: int = 1024,
+        h_dim: int = 512,
         dropout: float = 0.1,
-        # Training Parameters
-        batch_size: int = 8,
-        num_iterations: int = 50,  # Reduced from 10000 to 50 for quick testing
-        checkpoint_every: int = 10,  # Adjust as needed
-        log_every: int = 10,
+        batch_size: int = 16,
+        num_iterations: int = 2000,
+        checkpoint_every: int = 500,
+        log_every: int = 100,
         local_rank: int = -1,
-        dtype: str = "bf16",  # Change to "fp16" for mixed precision training when switching to GPU (not supported on CPU)
-)-> pathlib.Path:
+        dtype: str = "bf16",
+):
 
-    training_start_time = time.time()
-
-    # device = (torch.device(get_accelerator().device_name(), local_rank) if (local_rank > -1)
-    #           and get_accelerator().is_available() else torch.device("cpu"))
-    device = torch.device("cpu")
-    ################################
-    ###### Create Exp. Dir #########
-    ################################
-    if checkpoint_dir is None and load_checkpoint_dir is None:
-        log_dist(
-            "Need to specify one of checkpoint_dir"
-            " or load_checkpoint_dir",
-            ranks=[0],
-            level=logging.ERROR)
-        return
-    if checkpoint_dir is not None and load_checkpoint_dir is not None:
-        log_dist(
-            "Cannot specify both checkpoint_dir"
-            " and load_checkpoint_dir",
-            ranks=[0],
-            level=logging.ERROR)
-        return
-    if checkpoint_dir:
-        log_dist("Creating Experiment Directory",
-                 ranks=[0],
-                 level=logging.INFO)
-        checkpoint_dir = pathlib.Path(checkpoint_dir)
-        checkpoint_dir.mkdir(exist_ok=True)
-        all_arguments = {
-            # Dataset Params
-            "mask_prob": mask_prob,
-            "random_replace_prob": random_replace_prob,
-            "unmask_replace_prob": unmask_replace_prob,
-            "max_seq_length": max_seq_length,
-            "tokenizer": tokenizer,
-            # Model Params
-            "num_layers": num_layers,
-            "num_heads": num_heads,
-            "ff_dim": ff_dim,
-            "h_dim": h_dim,
-            "dropout": dropout,
-            # Training Params
-            "batch_size": batch_size,
-            "num_iterations": num_iterations,
-            "checkpoint_every": checkpoint_every,
-        }
-        exp_dir = create_experiment_dir(checkpoint_dir, all_arguments)
-        log_dist(f"Experiment Directory created at {exp_dir}",
-                 ranks=[0],
-                 level=logging.INFO)
-    else:
-        log_dist("Loading from Experiment Directory",
-                 ranks=[0],
-                 level=logging.INFO)
-        load_checkpoint_dir = pathlib.Path(load_checkpoint_dir)
-        assert load_checkpoint_dir.exists()
-        with (load_checkpoint_dir / "hparams.json").open("r") as handle:
-            hparams = json.load(handle)
-        # Set the hparams
-        # Dataset Params
-        mask_prob = hparams.get("mask_prob", mask_prob)
-        tokenizer = hparams.get("tokenizer", tokenizer)
-        random_replace_prob = hparams.get("random_replace_prob",
-                                          random_replace_prob)
-        unmask_replace_prob = hparams.get("unmask_replace_prob",
-                                          unmask_replace_prob)
-        max_seq_length = hparams.get("max_seq_length", max_seq_length)
-        # Model Params
-        ff_dim = hparams.get("ff_dim", ff_dim)
-        h_dim = hparams.get("h_dim", h_dim)
-        dropout = hparams.get("dropout", dropout)
-        num_layers = hparams.get("num_layers", num_layers)
-        num_heads = hparams.get("num_heads", num_heads)
-        # Training Params
-        batch_size = hparams.get("batch_size", batch_size)
-        _num_iterations = hparams.get("num_iterations", num_iterations)
-        num_iterations = max(num_iterations, _num_iterations)
-        checkpoint_every = hparams.get("checkpoint_every", checkpoint_every)
-        exp_dir = load_checkpoint_dir
-    # Tensorboard writer
-    if is_rank_0():
-        tb_dir = exp_dir / "tb_dir"
-        assert tb_dir.exists()
-        summary_writer = SummaryWriter(log_dir=tb_dir)
-    ################################
-    ###### Create Datasets #########
-    ################################
-    log_dist("Creating Datasets", ranks=[0], level=logging.INFO)
-    data_iterator = create_data_iterator(
-        mask_prob=mask_prob,
-        random_replace_prob=random_replace_prob,
-        unmask_replace_prob=unmask_replace_prob,
-        tokenizer=tokenizer,
-        max_seq_length=max_seq_length,
-        batch_size=batch_size,
-    )
-    log_dist("Dataset Creation Done", ranks=[0], level=logging.INFO)
-    ################################
-    ###### Create Model ############
-    ################################
-    log_dist("Creating Model", ranks=[0], level=logging.INFO)
-    model = create_model(
-        num_layers=num_layers,
-        num_heads=num_heads,
-        ff_dim=ff_dim,
-        h_dim=h_dim,
-        dropout=dropout,
-    )
-    log_dist("Model Creation Done", ranks=[0], level=logging.INFO)
-    ################################
-    ###### DeepSpeed engine ########
-    ################################
-    log_dist("Creating DeepSpeed engine", ranks=[0], level=logging.INFO)
-    assert (dtype == 'fp16' or dtype == 'bf16')
-    # Start timing the DeepSpeed engine creation
     start_time = time.time()
+
+    # Data loading and preprocessing
+    data_loading_start = time.time()
+
+    pipe_manager = NamedPipeManager(DATA_PIPE_PATH)
+
+    if is_rank_0():  # Only rank 0 writes to the pipe
+        wikitext_dataset = load_dataset("wikitext", "wikitext-2-v1", split="train")
+        wikitext_dataset = wikitext_dataset.filter(lambda record: record["text"] != "").map(lambda record: {"text": record["text"].rstrip("\n")})
+        pipe_manager.write_data_to_pipe(wikitext_dataset)
+
+    wikitext_dataset = pipe_manager.read_data_from_pipe()
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer)
+    masking_function_partial = partial(masking_function, tokenizer=tokenizer, mask_prob=mask_prob, random_replace_prob=random_replace_prob, unmask_replace_prob=unmask_replace_prob, max_length=max_seq_length)
+    dataset = WikiTextMLMDataset(wikitext_dataset, masking_function_partial)
+    data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    data_loading_end = time.time()
+
+    log_dist(f"<= Timer => Data preloading took {data_loading_end - data_loading_start:.2f} seconds", ranks=[0], level=logging.INFO)
+    log_dist("Dataset Creation Done", ranks=[0], level=logging.INFO)
+
+    log_dist("Creating Model", ranks=[0], level=logging.INFO)
+    model = create_model(num_layers=num_layers, num_heads=num_heads, ff_dim=ff_dim, h_dim=h_dim, dropout=dropout)
+    log_dist("Model Creation Done", ranks=[0], level=logging.INFO)
+
+    log_dist("Creating DeepSpeed engine", ranks=[0], level=logging.INFO)
     ds_config = {
         "train_micro_batch_size_per_gpu": batch_size,
         "optimizer": {
@@ -603,41 +87,48 @@ def train(
             }
         }
     }
-    model, _, _, _ = deepspeed.initialize(model=model,
-                                        model_parameters=model.parameters(),
-                                        config=ds_config)
+
+    model, _, _, _ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=ds_config)
     log_dist("DeepSpeed engine created", ranks=[0], level=logging.INFO)
 
-    # End timing the DeepSpeed engine creation
-    end_time = time.time()
-    log_dist(f"<= Timer => DeepSpeed engine creation took {end_time - start_time:.2f} seconds", ranks=[0], level=logging.INFO)
-
-    ################################
-    #### Load Model checkpoint #####
-    ################################
     start_step = 1
     if load_checkpoint_dir is not None:
-        start_time = time.time()
+        start_checkpoint_loading = time.time()
         _, client_state = model.load_checkpoint(load_dir=load_checkpoint_dir)
         checkpoint_step = client_state['checkpoint_step']
         start_step = checkpoint_step + 1
+        end_checkpoint_loading = time.time()
+        log_dist(f"Checkpoint loading took {end_checkpoint_loading - start_checkpoint_loading:.2f} seconds", ranks=[0], level=logging.INFO)
 
-        end_time = time.time()
-        log_dist(f"<= Timer => Checkpoint loading took {end_time - start_time:.2f} seconds", ranks=[0], level=logging.INFO)
+    log_dist(f"Total number of model parameters: {sum([p.numel() for p in model.parameters()]):,d}", ranks=[0], level=logging.INFO)
 
-    ################################
-    ####### The Training Loop ######
-    ################################
-    log_dist(
-        f"Total number of model parameters: {sum([p.numel() for p in model.parameters()]):,d}",
-        ranks=[0],
-        level=logging.INFO)
+    # Create experiment directory
+    all_arguments = {
+        "checkpoint_dir": checkpoint_dir,
+        "load_checkpoint_dir": load_checkpoint_dir,
+        "mask_prob": mask_prob,
+        "random_replace_prob": random_replace_prob,
+        "unmask_replace_prob": unmask_replace_prob,
+        "max_seq_length": max_seq_length,
+        "tokenizer": tokenizer,
+        "num_layers": num_layers,
+        "num_heads": num_heads,
+        "ff_dim": ff_dim,
+        "h_dim": h_dim,
+        "dropout": dropout,
+        "batch_size": batch_size,
+        "num_iterations": num_iterations,
+        "checkpoint_every": checkpoint_every,
+        "log_every": log_every,
+        "local_rank": local_rank,
+        "dtype": dtype,
+    }
+    exp_dir = create_experiment_dir(pathlib.Path(checkpoint_dir), all_arguments)
+
     model.train()
     losses = []
-    epoch_times = []
-    log_dist("Starting training loop", ranks=[0], level=logging.INFO)
-    for step, batch in enumerate(data_iterator, start=start_step):
-        log_dist(f"Step: {step}", ranks=[0], level=logging.INFO)  # Log the step
+    for step, batch in enumerate(data_loader, start=start_step):
+        log_dist(f"Step: {step}", ranks=[0], level=logging.INFO)
         if step >= num_iterations:
             break
 
@@ -671,29 +162,21 @@ def train(
                     level=logging.INFO)
 
         epoch_end_time = time.time()
-        epoch_time = epoch_end_time - epoch_start_time
-        epoch_times.append(epoch_time)
-        log_dist(f"<= Timer => Epoch {step} took {epoch_time:.2f} seconds", ranks=[0], level=logging.INFO)
-
-    if epoch_times:
-        avg_epoch_time = sum(epoch_times) / len(epoch_times)
-        log_dist(f"<= Timer => Average epoch time: {avg_epoch_time:.2f} seconds", ranks=[0], level=logging.INFO)
+        log_dist(f"<= Timer => Epoch {step} took {epoch_end_time - epoch_start_time:.2f} seconds", ranks=[0], level=logging.INFO)
 
     # Save the last checkpoint if not saved yet
     if step % checkpoint_every != 0:
-        start_time = time.time()
         model.save_checkpoint(save_dir=exp_dir,
                             client_state={'checkpoint_step': step})
-        end_time = time.time()
-        log_dist(f"<= Timer => Checkpoint saving took {end_time - start_time:.2f} seconds", ranks=[0], level=logging.INFO)
-
         log_dist("Saved model to {0}".format(exp_dir),
                 ranks=[0],
                 level=logging.INFO)
-    time.sleep(0.1)  # Optional: Add a small delay to see log output more frequently
 
     training_end_time = time.time()
-    log_dist(f"<= Timer => Total training time: {(training_end_time - training_start_time) /60:.2f} minutes", ranks=[0], level=logging.INFO)
+    log_dist(f"<= Timer => Total training time: {(training_end_time - start_time) / 60:.2f} minutes", ranks=[0], level=logging.INFO)
+
+    # Remove the named pipe after use
+    pipe_manager.remove_named_pipe()
 
     return exp_dir
 
