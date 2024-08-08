@@ -99,32 +99,7 @@ def masking_function(
         unmask_replace_prob: float,
         max_length: int,
 ) -> Tuple[List[int], List[int]]:
-    """Given a text string, randomly mask wordpieces for Bert MLM
-    training.
 
-    Args:
-        text (str):
-            The input text
-        tokenizer (TokenizerType):
-            The tokenizer for tokenization
-        mask_prob (float):
-            What fraction of tokens to mask
-        random_replace_prob (float):
-            Of the masked tokens, how many should be replaced with
-            random tokens (improves performance)
-        unmask_replace_prob (float):
-            Of the masked tokens, how many should be replaced with
-            the original token (improves performance)
-        max_length (int):
-            The maximum sequence length to consider. Note that for
-            Bert style models, this is a function of the number of
-            positional embeddings you learn
-
-    Returns:
-        Tuple[List[int], List[int]]:
-            The masked token ids (based on the tokenizer passed),
-            and the output labels (padded with `tokenizer.pad_token_id`)
-    """
     # Note: By default, encode does add the BOS and EOS token
     # Disabling that behaviour to make this more clear
     tokenized_ids = ([tokenizer.bos_token_id] +
@@ -183,21 +158,6 @@ def masking_function(
 
 
 class WikiTextMLMDataset(Dataset):
-    """A [Map style dataset](https://pytorch.org/docs/stable/data.html)
-    for iterating over the wikitext dataset. Note that this assumes
-    the dataset can fit in memory. For larger datasets
-    you'd want to shard them and use an iterable dataset (eg: see
-    [Infinibatch](https://github.com/microsoft/infinibatch))
-
-    Args:
-        Dataset (datasets.arrow_dataset.Dataset):
-            The wikitext dataset
-        masking_function (Callable[[str], Tuple[List[int], List[int]]])
-            The masking function. To generate one training instance,
-            the masking function is applied to the `text` of a dataset
-            record
-
-    """
     def __init__(
         self,
         dataset: datasets.arrow_dataset.Dataset,
@@ -243,28 +203,7 @@ def create_data_iterator(
         max_seq_length: int = 512,
         tokenizer: str = "roberta-base",
 ) -> InfiniteIterator:
-    """Create the dataloader.
 
-    Args:
-        mask_prob (float):
-            Fraction of tokens to mask
-        random_replace_prob (float):
-            Fraction of masked tokens to replace with random token
-        unmask_replace_prob (float):
-            Fraction of masked tokens to replace with the actual token
-        batch_size (int):
-            The batch size of the generated tensors
-        max_seq_length (int, optional):
-            The maximum sequence length for the MLM task. Defaults to 512.
-        tokenizer (str, optional):
-            The tokenizer to use. Defaults to "roberta-base".
-
-    Returns:
-        InfiniteIterator:
-            The torch DataLoader, wrapped in an InfiniteIterator class, to
-            be able to continuously generate samples
-
-    """
     data_loading_start = time.time()
     wikitext_dataset = datasets.load_dataset("wikitext",
                                              "wikitext-2-v1",
@@ -314,23 +253,7 @@ class RobertaLMHeadWithMaskedPredict(RobertaLMHead):
         masked_token_indices: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
-        """The current `transformers` library does not provide support
-        for masked_token_indices. This function provides the support, by
-        running the final forward pass only for the masked indices. This saves
-        memory
 
-        Args:
-            features (torch.Tensor):
-                The features to select from. Shape (batch, seq_len, h_dim)
-            masked_token_indices (torch.Tensor, optional):
-                The indices of masked tokens for index select. Defaults to None.
-                Shape: (num_masked_tokens,)
-
-        Returns:
-            torch.Tensor:
-                The index selected features. Shape (num_masked_tokens, h_dim)
-
-        """
         if masked_token_indices is not None:
             features = torch.index_select(
                 features.view(-1, features.shape[-1]), 0, masked_token_indices)
@@ -351,21 +274,7 @@ class RobertaMLMModel(RobertaPreTrainedModel):
             attention_mask: torch.Tensor,
             tgt_tokens: torch.Tensor,
     ) -> torch.Tensor:
-        """The forward pass for the MLM task
 
-        Args:
-            src_tokens (torch.Tensor):
-                The masked token indices. Shape: (batch, seq_len)
-            attention_mask (torch.Tensor):
-                The attention mask, since the batches are padded
-                to the largest sequence. Shape: (batch, seq_len)
-            tgt_tokens (torch.Tensor):
-                The output tokens (padded with `config.pad_token_id`)
-
-        Returns:
-            torch.Tensor:
-                The MLM loss
-        """
         # shape: (batch, seq_len, h_dim)
         sequence_output, *_ = self.encoder(input_ids=src_tokens,
                                            attention_mask=attention_mask,
@@ -392,32 +301,7 @@ class RobertaMLMModel(RobertaPreTrainedModel):
 
 def create_model(num_layers: int, num_heads: int, ff_dim: int, h_dim: int,
                  dropout: float) -> RobertaMLMModel:
-    """Create a Bert model with the specified `num_heads`, `ff_dim`,
-    `h_dim` and `dropout`
 
-    Args:
-        num_layers (int):
-            The number of layers
-        num_heads (int):
-            The number of attention heads
-        ff_dim (int):
-            The intermediate hidden size of
-            the feed forward block of the
-            transformer
-        h_dim (int):
-            The hidden dim of the intermediate
-            representations of the transformer
-        dropout (float):
-            The value of dropout to be used.
-            Note that we apply the same dropout
-            to both the attention layers and the
-            FF layers
-
-    Returns:
-        RobertaMLMModel:
-            A Roberta model for MLM task
-
-    """
     roberta_config_dict = {
         "attention_probs_dropout_prob": dropout,
         "bos_token_id": 0,
@@ -459,26 +343,7 @@ def get_unique_identifier(length: int = 8) -> str:
 
 def create_experiment_dir(checkpoint_dir: pathlib.Path,
                           all_arguments: Dict[str, Any]) -> pathlib.Path:
-    """Create an experiment directory and save all arguments in it.
-    Additionally, also store the githash and gitdiff. Finally create
-    a directory for `Tensorboard` logs. The structure would look something
-    like
-        checkpoint_dir
-            `-experiment-name
-                |- hparams.json
-                |- githash.log
-                |- gitdiff.log
-                `- tb_dir/
 
-    Args:
-        checkpoint_dir (pathlib.Path):
-            The base checkpoint directory
-        all_arguments (Dict[str, Any]):
-            The arguments to save
-
-    Returns:
-        pathlib.Path: The experiment directory
-    """
     # experiment name follows the following convention
     # {exp_type}.{YYYY}.{MM}.{DD}.{HH}.{MM}.{SS}.{uuid}
     current_time = datetime.datetime.now(pytz.timezone("US/Pacific"))
@@ -542,24 +407,7 @@ def load_model_checkpoint(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
 ) -> Tuple[int, torch.nn.Module, torch.optim.Optimizer]:
-    """Loads the optimizer state dict and model state dict from the load_checkpoint_dir
-    into the passed model and optimizer. Searches for the most recent checkpoint to
-    load from
 
-    Args:
-        load_checkpoint_dir (pathlib.Path):
-            The base checkpoint directory to load from
-        model (torch.nn.Module):
-            The model to load the checkpoint weights into
-        optimizer (torch.optim.Optimizer):
-            The optimizer to load the checkpoint weigths into
-
-    Returns:
-        Tuple[int, torch.nn.Module, torch.optim.Optimizer]:
-            The checkpoint step, model with state_dict loaded and
-            optimizer with state_dict loaded
-
-    """
     log_dist(
         f"Loading model and optimizer checkpoint from {load_checkpoint_dir}",
         ranks=[0],
@@ -620,60 +468,7 @@ def train(
         local_rank: int = -1,
         dtype: str = "bf16",  # Change to "fp16" for mixed precision training when switching to GPU (not supported on CPU)
 )-> pathlib.Path:
-    """Trains a [Bert style](https://arxiv.org/pdf/1810.04805.pdf)
-    (transformer encoder only) model for MLM Task
 
-    Args:
-        checkpoint_dir (str):
-            The base experiment directory to save experiments to
-        mask_prob (float, optional):
-            The fraction of tokens to mask. Defaults to 0.15.
-        random_replace_prob (float, optional):
-            The fraction of masked tokens to replace with random token.
-            Defaults to 0.1.
-        unmask_replace_prob (float, optional):
-            The fraction of masked tokens to leave unchanged.
-            Defaults to 0.1.
-        max_seq_length (int, optional):
-            The maximum sequence length of the examples. Defaults to 512.
-        tokenizer (str, optional):
-            The tokenizer to use. Defaults to "roberta-base".
-        num_layers (int, optional):
-            The number of layers in the Bert model. Defaults to 6.
-        num_heads (int, optional):
-            Number of attention heads to use. Defaults to 8.
-        ff_dim (int, optional):
-            Size of the intermediate dimension in the FF layer.
-            Defaults to 512.
-        h_dim (int, optional):
-            Size of intermediate representations.
-            Defaults to 256.
-        dropout (float, optional):
-            Amout of Dropout to use. Defaults to 0.1.
-        batch_size (int, optional):
-            The minibatch size. Defaults to 8.
-        num_iterations (int, optional):
-            Total number of iterations to run the model for.
-            Defaults to 10000.
-        checkpoint_every (int, optional):
-            Save checkpoint after these many steps.
-
-            ..note ::
-
-                You want this to be frequent enough that you can
-                resume training in case it crashes, but not so much
-                that you fill up your entire storage !
-
-            Defaults to 1000.
-        log_every (int, optional):
-            Print logs after these many steps. Defaults to 10.
-        local_rank (int, optional):
-            Which GPU to run on (-1 for CPU). Defaults to -1.
-
-    Returns:
-        pathlib.Path: The final experiment directory
-
-    """
     training_start_time = time.time()
 
     # device = (torch.device(get_accelerator().device_name(), local_rank) if (local_rank > -1)
