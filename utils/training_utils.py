@@ -2,6 +2,14 @@ import time
 import torch
 import numpy as np
 import logging
+import logging
+import torch
+import json
+import sh
+import pytz
+import datetime
+import pathlib
+from typing import Dict, Any
 
 def log_dist(message, ranks=None, level=logging.INFO):
     if ranks is None or is_rank_0():
@@ -31,14 +39,11 @@ def train_model(model, data_iterator, num_iterations, log_every, checkpoint_ever
         for key, value in batch.items():
             batch[key] = value.to("cpu")  # Ensure all tensors are moved to CPU
 
-        # Forward pass
-        loss = model(**batch)
+        loss = model(**batch) # Forward pass
 
-        # Backward pass
-        model.backward(loss)
+        model.backward(loss) # Backward pass
 
-        # Optimizer Step
-        model.step()
+        model.step() # Optimizer Step
 
         losses.append(loss.item())
 
@@ -64,9 +69,5 @@ def train_model(model, data_iterator, num_iterations, log_every, checkpoint_ever
 
     return total_epoch_time / 60  # Return total training time in minutes
 
-def load_checkpoint(model, load_checkpoint_dir):
-    start_time = time.time()
-    _, client_state = model.load_checkpoint(load_dir=load_checkpoint_dir)
-    end_time = time.time()
-    log_dist(f"<= Timer => Checkpoint loading took {end_time - start_time:.2f} seconds", ranks=[0], level=logging.INFO)
-    return client_state.get('checkpoint_step', 1)
+def get_unique_identifier():
+    return str(uuid.uuid4())
