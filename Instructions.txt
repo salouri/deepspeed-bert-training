@@ -6,7 +6,7 @@ Setup
 
 Step 1: Clone the Repository
 
-git clone https://github.com/yourusername/deepspeed-bert-training.git
+git clone https://github.com/salouri/deepspeed-bert-training.git
 cd deepspeed-bert-training
 
 Step 2: Create and Activate Conda Environment
@@ -20,8 +20,13 @@ pip install -r requirements.txt
 
 Step 4: Run the Script
 
-python train_bert_ds.py --checkpoint_dir ./experiment
+To start training the BERT model using DeepSpeed, use the following command:
 
+    deepspeed --num_gpus=0 --bind_cores_to_rank train_bert_ds.py
+
+ Note: If you encounter any issues with numactl or don't require NUMA-specific optimizations, just bypass it by
+ not using the --bind_cores_to_rank option. Simply run:
+    deepspeed --num_gpus=0 train_bert_ds.py
 Dependencies
 
 - Python 3.10
