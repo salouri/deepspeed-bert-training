@@ -24,9 +24,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Named pipe paths (use environment variables)
-DATA_PIPE_PATH = os.getenv("DATA_PIPE_PATH", "/tmp/data_pipe")
-CHECKPOINT_PIPE_PATH = os.getenv("CHECKPOINT_PIPE_PATH", "/tmp/checkpoint_pipe")
-LOG_PIPE_PATH = os.getenv("LOG_PIPE_PATH", "/tmp/log_pipe")
+DATA_DIR = os.path.join(os.path.dirname(__file__),"data")
+DATA_PIPE_PATH = os.getenv("DATA_PIPE_PATH", os.path.join(DATA_DIR, "data_pipe"))
+CHECKPOINT_PIPE_PATH = os.getenv("CHECKPOINT_PIPE_PATH",  os.path.join(DATA_DIR, "checkpoint_pipe"))
+LOG_PIPE_PATH = os.getenv("LOG_PIPE_PATH",  os.path.join(DATA_DIR, "log_pipe"))
 
 def train(
         checkpoint_dir: str = None,
@@ -57,7 +58,6 @@ def train(
 
     # Data loading and preprocessing
     data_loading_start = time.time()
-
     if is_rank_0():  # Only rank 0 writes to the pipe
         wikitext_dataset = load_dataset("wikitext", "wikitext-2-v1", split="train")
         wikitext_dataset = wikitext_dataset.filter(lambda record: record["text"] != "").map(lambda record: {"text": record["text"].rstrip("\n")})
@@ -78,21 +78,26 @@ def train(
     log_dist("Model Creation Done", ranks=[0], level=logging.INFO)
 
     log_dist("Creating DeepSpeed engine", ranks=[0], level=logging.INFO)
-    ds_config = get_ds_config()
-
+    ds_config = get_ds_config(batch_size, dtype)
     model, _, _, _ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=ds_config)
     log_dist("DeepSpeed engine created", ranks=[0], level=logging.INFO)
 
     start_step = 1
+
     if load_checkpoint_dir is not None:
         start_checkpoint_loading = time.time()
-        model, start_step = load_model_checkpoint(model, load_checkpoint_dir)
+        if is_rank_0():
+            model, start_step = load_model_checkpoint(model, load_checkpoint_dir)
+            checkpoint_pipe_manager.write_data_to_pipe({'start_step': start_step})
+        else:
+            start_step = checkpoint_pipe_manager.read_data_from_pipe()['start_step']
         end_checkpoint_loading = time.time()
         log_dist(f"Checkpoint loading took {end_checkpoint_loading - start_checkpoint_loading:.2f} seconds", ranks=[0], level=logging.INFO)
 
     log_dist(f"Total number of model parameters: {sum([p.numel() for p in model.parameters()]):,d}", ranks=[0], level=logging.INFO)
     model.train()
     losses = []
+    epoch_times = []
     summary_writer = SummaryWriter(log_dir=checkpoint_dir)
     for step, batch in enumerate(data_loader, start=start_step):
         log_dist(f"Step: {step}", ranks=[0], level=logging.INFO)
@@ -132,19 +137,31 @@ def train(
             log_dist(f"Read metrics: {metrics_from_pipe}", ranks=[0], level=logging.INFO)
 
         if step % checkpoint_every == 0:
-            start_checkpoint_time = time.time()
-            save_model_checkpoint(model, checkpoint_dir, step)
-            end_checkpoint_time = time.time()
-            log_dist(f"<= Timer => Checkpoint saving took {end_checkpoint_time - start_checkpoint_time:.2f} seconds", ranks=[0], level=logging.INFO)
-            log_dist("Saved model to {0}".format(checkpoint_dir), ranks=[0], level=logging.INFO)
+            start_time = time.time()
+            if is_rank_0():
+                model, start_step = save_model_checkpoint(model, checkpoint_dir, step)
+                checkpoint_pipe_manager.write_data_to_pipe({'start_step': start_step})
+            else:
+                start_step = checkpoint_pipe_manager.read_data_from_pipe()['start_step']
+            end_time = time.time()
+            log_dist(f"<= Timer => Checkpoint saving took {end_time - start_time:.2f} seconds", ranks=[0], level=logging.INFO)
+
+            log_dist("Saved model to {0}".format(checkpoint_dir),
+                    ranks=[0],
+                    level=logging.INFO)
 
         epoch_end_time = time.time()
+        epoch_times.append(epoch_end_time - epoch_start_time)
         log_dist(f"<= Timer => Epoch {step} took {epoch_end_time - epoch_start_time:.2f} seconds", ranks=[0], level=logging.INFO)
 
     # Save the last checkpoint if not saved yet
     if step % checkpoint_every != 0:
         start_checkpoint_time = time.time()
-        save_model_checkpoint(model, checkpoint_dir, step)
+        if is_rank_0():
+            save_model_checkpoint(model, checkpoint_dir, step)
+            checkpoint_pipe_manager.write_data_to_pipe({'step': step})
+        else:
+            step = checkpoint_pipe_manager.read_data_from_pipe()['step']
         end_checkpoint_time = time.time()
         log_dist(f"<= Timer => Checkpoint saving took {end_checkpoint_time - start_checkpoint_time:.2f} seconds", ranks=[0], level=logging.INFO)
 
@@ -153,6 +170,7 @@ def train(
                 level=logging.INFO)
 
     training_end_time = time.time()
+    average_epoch_time = sum(epoch_times) / len(epoch_times)
     log_dist(f"<= Timer => Total training time: {(training_end_time - start_time) / 60:.2f} minutes", ranks=[0], level=logging.INFO)
     return checkpoint_dir
 
