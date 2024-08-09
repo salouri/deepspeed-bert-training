@@ -15,9 +15,9 @@ import fire
 
 from utils.data_utils import masking_function, WikiTextMLMDataset
 from utils.training_utils import log_dist, is_rank_0
-from utils.config_utils import get_ds_config
+from utils.config_utils import get_deepspeed_config
 from utils.model_utils import create_model, save_model_checkpoint, load_model_checkpoint
-from utils.named_pipe_utils import NamedPipeManager, log_metrics_to_pipe, read_metrics_from_pipe
+from utils.named_pipe_utils import NamedPipeManager
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -52,18 +52,18 @@ def train(
     start_time = time.time()
 
     # Initialize named pipe managers
-    data_pipe_manager = NamedPipeManager(DATA_PIPE_PATH)
-    checkpoint_pipe_manager = NamedPipeManager(CHECKPOINT_PIPE_PATH)
-    log_pipe_manager = NamedPipeManager(LOG_PIPE_PATH)
+    data_pipe = NamedPipeManager(DATA_PIPE_PATH)
+    checkpoint_pipe = NamedPipeManager(CHECKPOINT_PIPE_PATH)
+    log_pipe = NamedPipeManager(LOG_PIPE_PATH)
 
     # Data loading and preprocessing
     data_loading_start = time.time()
     if is_rank_0():  # Only rank 0 writes to the pipe
         wikitext_dataset = load_dataset("wikitext", "wikitext-2-v1", split="train")
         wikitext_dataset = wikitext_dataset.filter(lambda record: record["text"] != "").map(lambda record: {"text": record["text"].rstrip("\n")})
-        data_pipe_manager.write_data_to_pipe(wikitext_dataset)
+        data_pipe.write_to_pipe(wikitext_dataset)
 
-    wikitext_dataset = data_pipe_manager.read_data_from_pipe()
+    wikitext_dataset = data_pipe.read_from_pipe()
     tokenizer = AutoTokenizer.from_pretrained(tokenizer)
     masking_function_partial = partial(masking_function, tokenizer=tokenizer, mask_prob=mask_prob, random_replace_prob=random_replace_prob, unmask_replace_prob=unmask_replace_prob, max_length=max_seq_length)
     dataset = WikiTextMLMDataset(wikitext_dataset, masking_function_partial)
@@ -78,7 +78,7 @@ def train(
     log_dist("Model Creation Done", ranks=[0], level=logging.INFO)
 
     log_dist("Creating DeepSpeed engine", ranks=[0], level=logging.INFO)
-    ds_config = get_ds_config(batch_size, dtype)
+    ds_config = get_deepspeed_config(batch_size, dtype)
     model, _, _, _ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=ds_config)
     log_dist("DeepSpeed engine created", ranks=[0], level=logging.INFO)
 
@@ -88,9 +88,9 @@ def train(
         start_checkpoint_loading = time.time()
         if is_rank_0():
             model, start_step = load_model_checkpoint(model, load_checkpoint_dir)
-            checkpoint_pipe_manager.write_data_to_pipe({'start_step': start_step})
+            checkpoint_pipe.write_to_pipe({'start_step': start_step})
         else:
-            start_step = checkpoint_pipe_manager.read_data_from_pipe()['start_step']
+            start_step = checkpoint_pipe.read_from_pipe()['start_step']
         end_checkpoint_loading = time.time()
         log_dist(f"Checkpoint loading took {end_checkpoint_loading - start_checkpoint_loading:.2f} seconds", ranks=[0], level=logging.INFO)
 
@@ -122,7 +122,7 @@ def train(
             "step": step,
             "loss": np.mean(losses)
         }
-        log_metrics_to_pipe(LOG_PIPE_PATH, metrics)
+        log_pipe.write_to_pipe(metrics)
 
         if step % log_every == 0:
             log_dist("Loss: {0:.4f}".format(np.mean(losses)),
@@ -132,7 +132,7 @@ def train(
                 summary_writer.add_scalar(f"Train/loss", np.mean(losses), step)
 
         # Example usage of reading metrics from pipe (if any other process writes to it)
-        metrics_from_pipe = read_metrics_from_pipe(LOG_PIPE_PATH)
+        metrics_from_pipe = log_pipe.read_from_pipe()
         if metrics_from_pipe:
             log_dist(f"Read metrics: {metrics_from_pipe}", ranks=[0], level=logging.INFO)
 
@@ -140,9 +140,9 @@ def train(
             start_time = time.time()
             if is_rank_0():
                 model, start_step = save_model_checkpoint(model, checkpoint_dir, step)
-                checkpoint_pipe_manager.write_data_to_pipe({'start_step': start_step})
+                checkpoint_pipe.write_to_pipe({'start_step': start_step})
             else:
-                start_step = checkpoint_pipe_manager.read_data_from_pipe()['start_step']
+                start_step = checkpoint_pipe.read_from_pipe()['start_step']
             end_time = time.time()
             log_dist(f"<= Timer => Checkpoint saving took {end_time - start_time:.2f} seconds", ranks=[0], level=logging.INFO)
 
@@ -159,9 +159,9 @@ def train(
         start_checkpoint_time = time.time()
         if is_rank_0():
             save_model_checkpoint(model, checkpoint_dir, step)
-            checkpoint_pipe_manager.write_data_to_pipe({'step': step})
+            checkpoint_pipe.write_to_pipe({'step': step})
         else:
-            step = checkpoint_pipe_manager.read_data_from_pipe()['step']
+            step = checkpoint_pipe.read_from_pipe()['step']
         end_checkpoint_time = time.time()
         log_dist(f"<= Timer => Checkpoint saving took {end_checkpoint_time - start_checkpoint_time:.2f} seconds", ranks=[0], level=logging.INFO)
 
