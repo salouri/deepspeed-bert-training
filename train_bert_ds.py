@@ -1,37 +1,32 @@
 import os
 import time
+import logging
 import torch
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 import deepspeed
 from transformers import AutoTokenizer
 from datasets import load_dataset
-import json
 from functools import partial
 from typing import Dict, Any
 import random
 import numpy as np
-import datetime
-import pytz
-import pathlib
 import fire
 
-from utils.data_utils import masking_function, create_model, WikiTextMLMDataset
+from utils.data_utils import masking_function, WikiTextMLMDataset
 from utils.training_utils import log_dist, is_rank_0
 from utils.config_utils import get_ds_config
 from utils.model_utils import create_model, save_model_checkpoint, load_model_checkpoint
 from utils.named_pipe_utils import NamedPipeManager, log_metrics_to_pipe, read_metrics_from_pipe
 from dotenv import load_dotenv
 
+# Load environment variables
 load_dotenv()
-
-# Named pipe paths
-
 
 # Named pipe paths (use environment variables)
 DATA_PIPE_PATH = os.getenv("DATA_PIPE_PATH", "/tmp/data_pipe")
 CHECKPOINT_PIPE_PATH = os.getenv("CHECKPOINT_PIPE_PATH", "/tmp/checkpoint_pipe")
 LOG_PIPE_PATH = os.getenv("LOG_PIPE_PATH", "/tmp/log_pipe")
-
 
 def train(
         checkpoint_dir: str = None,
@@ -57,6 +52,7 @@ def train(
 
     # Initialize named pipe managers
     data_pipe_manager = NamedPipeManager(DATA_PIPE_PATH)
+    checkpoint_pipe_manager = NamedPipeManager(CHECKPOINT_PIPE_PATH)
     log_pipe_manager = NamedPipeManager(LOG_PIPE_PATH)
 
     # Data loading and preprocessing
@@ -90,15 +86,14 @@ def train(
     start_step = 1
     if load_checkpoint_dir is not None:
         start_checkpoint_loading = time.time()
-        _, client_state = model.load_checkpoint(load_dir=load_checkpoint_dir)
-        checkpoint_step = client_state['checkpoint_step']
-        start_step = checkpoint_step + 1
+        model, start_step = load_model_checkpoint(model, load_checkpoint_dir)
         end_checkpoint_loading = time.time()
         log_dist(f"Checkpoint loading took {end_checkpoint_loading - start_checkpoint_loading:.2f} seconds", ranks=[0], level=logging.INFO)
 
     log_dist(f"Total number of model parameters: {sum([p.numel() for p in model.parameters()]):,d}", ranks=[0], level=logging.INFO)
     model.train()
     losses = []
+    summary_writer = SummaryWriter(log_dir=checkpoint_dir)
     for step, batch in enumerate(data_loader, start=start_step):
         log_dist(f"Step: {step}", ranks=[0], level=logging.INFO)
         if step >= num_iterations:
@@ -116,6 +111,14 @@ def train(
         # Optimizer Step
         model.step()
         losses.append(loss.item())
+
+        # Log the metrics to the named pipe
+        metrics = {
+            "step": step,
+            "loss": np.mean(losses)
+        }
+        log_metrics_to_pipe(LOG_PIPE_PATH, metrics)
+
         if step % log_every == 0:
             log_dist("Loss: {0:.4f}".format(np.mean(losses)),
                     ranks=[0],
@@ -124,27 +127,27 @@ def train(
                 summary_writer.add_scalar(f"Train/loss", np.mean(losses), step)
 
         # Example usage of reading metrics from pipe (if any other process writes to it)
-        metrics = log_pipe_manager.read_metrics_from_pipe()
-        log_dist(f"Read metrics: {metrics}", ranks=[0], level=logging.INFO)
+        metrics_from_pipe = read_metrics_from_pipe(LOG_PIPE_PATH)
+        if metrics_from_pipe:
+            log_dist(f"Read metrics: {metrics_from_pipe}", ranks=[0], level=logging.INFO)
 
         if step % checkpoint_every == 0:
-            start_time = time.time()
-            model.save_checkpoint(save_dir=checkpoint_dir,
-                                client_state={'checkpoint_step': step})
-            end_time = time.time()
-            log_dist(f"<= Timer => Checkpoint saving took {end_time - start_time:.2f} seconds", ranks=[0], level=logging.INFO)
-
-            log_dist("Saved model to {0}".format(checkpoint_dir),
-                    ranks=[0],
-                    level=logging.INFO)
+            start_checkpoint_time = time.time()
+            save_model_checkpoint(model, checkpoint_dir, step)
+            end_checkpoint_time = time.time()
+            log_dist(f"<= Timer => Checkpoint saving took {end_checkpoint_time - start_checkpoint_time:.2f} seconds", ranks=[0], level=logging.INFO)
+            log_dist("Saved model to {0}".format(checkpoint_dir), ranks=[0], level=logging.INFO)
 
         epoch_end_time = time.time()
         log_dist(f"<= Timer => Epoch {step} took {epoch_end_time - epoch_start_time:.2f} seconds", ranks=[0], level=logging.INFO)
 
     # Save the last checkpoint if not saved yet
     if step % checkpoint_every != 0:
-        model.save_checkpoint(save_dir=checkpoint_dir,
-                            client_state={'checkpoint_step': step})
+        start_checkpoint_time = time.time()
+        save_model_checkpoint(model, checkpoint_dir, step)
+        end_checkpoint_time = time.time()
+        log_dist(f"<= Timer => Checkpoint saving took {end_checkpoint_time - start_checkpoint_time:.2f} seconds", ranks=[0], level=logging.INFO)
+
         log_dist("Saved model to {0}".format(checkpoint_dir),
                 ranks=[0],
                 level=logging.INFO)
