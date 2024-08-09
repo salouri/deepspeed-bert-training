@@ -24,5 +24,17 @@ def get_deepspeed_config(batch_size: int):
             "offload_optimizer": {
                 "device": "cpu"
             }
+        },
+        "fp16": {
+        "enabled": False
+    },
+    "cpu_offload": True,
+    "cpu_offload_params": {
+        "offload_optimizer": {
+            "device": "cpu",
+            "pin_memory": True
         }
+    },
+    "fp32_allreduce": True,
+    "disable_numa": True
     }
