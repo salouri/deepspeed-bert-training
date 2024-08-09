@@ -18,16 +18,16 @@ from utils.training_utils import log_dist, is_rank_0
 from utils.config_utils import get_deepspeed_config
 from utils.model_utils import create_model, save_model_checkpoint, load_model_checkpoint
 from utils.named_pipe_utils import NamedPipeManager
-from dotenv import load_dotenv
+from dotenv import dotenv_values
 
 # Load environment variables
-load_dotenv()
+config = dotenv_values(".env")
 
 # Named pipe paths (use environment variables)
 DATA_DIR = os.path.join(os.path.dirname(__file__),"data")
-DATA_PIPE_PATH = os.getenv("DATA_PIPE_PATH", os.path.join(DATA_DIR, "data_pipe"))
-CHECKPOINT_PIPE_PATH = os.getenv("CHECKPOINT_PIPE_PATH",  os.path.join(DATA_DIR, "checkpoint_pipe"))
-LOG_PIPE_PATH = os.getenv("LOG_PIPE_PATH",  os.path.join(DATA_DIR, "log_pipe"))
+DATA_PIPE_PATH = config.get("DATA_PIPE_PATH", os.path.join(DATA_DIR, "data_pipe"))
+CHECKPOINT_PIPE_PATH =config.get("CHECKPOINT_PIPE_PATH",  os.path.join(DATA_DIR, "checkpoint_pipe"))
+LOG_PIPE_PATH = config.get("LOG_PIPE_PATH",  os.path.join(DATA_DIR, "log_pipe"))
 
 def train(
         checkpoint_dir: str = None,
